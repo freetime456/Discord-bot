@@ -19,4 +19,5 @@ jobs:
       - name: Bot起動
         env:
           DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
+          ADMIN_USERNAME: ${{ secrets.ADMIN_USERNAME }}
         run: python bot.py
