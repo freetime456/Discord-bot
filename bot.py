@@ -3,51 +3,140 @@ import discord
 from discord.ext import commands
 from discord import app_commands
 
-# =====================================
-# 環境変数
-# =====================================
-
 TOKEN = os.environ["DISCORD_TOKEN"]
 ADMIN_USERNAME = os.environ["ADMIN_USERNAME"].lstrip("@")
 
-# =====================================
-# Discord設定
-# =====================================
-
 intents = discord.Intents.default()
 intents.message_content = True
+intents.members = True
 
-bot = commands.Bot(
-    command_prefix="!",
-    intents=intents
-)
+bot = commands.Bot(command_prefix="!", intents=intents)
 
-# ユーザーID : チケット情報
 tickets = {}
 
 
-# =====================================
+# =========================
 # 管理者を探す
-# =====================================
-
-async def find_admin():
-
-    # Botが参加しているサーバーから探す
-    for guild in bot.guilds:
-
-        for member in guild.members:
-
-            # Discordユーザー名で検索
-            if member.name.lower() == ADMIN_USERNAME.lower():
-                return member
-
+# =========================
+async def find_admin(guild):
+    for member in guild.members:
+        if member.name.lower() == ADMIN_USERNAME.lower():
+            return member
     return None
 
 
-# =====================================
-# サポート選択メニュー
-# =====================================
+# =========================
+# 問い合わせ送信ボタン
+# =========================
+class CloseView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
 
+    @discord.ui.button(
+        label="問い合わせを送信",
+        style=discord.ButtonStyle.green,
+        emoji="📨",
+        custom_id="send_ticket"
+    )
+    async def send_ticket(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        user = interaction.user
+
+        if user.id not in tickets:
+            await interaction.response.send_message(
+                "❌ このチケットは見つかりません。",
+                ephemeral=True
+            )
+            return
+
+        ticket = tickets[user.id]
+
+        if ticket["status"] == "sent":
+            await interaction.response.send_message(
+                "⚠️ すでに管理者へ送信されています。",
+                ephemeral=True
+            )
+            return
+
+        admin = await find_admin(interaction.guild)
+
+        if admin is None:
+            await interaction.response.send_message(
+                "❌ 管理者が見つかりません。",
+                ephemeral=True
+            )
+            return
+
+        history = ticket["messages"]
+
+        if not history:
+            await interaction.response.send_message(
+                "❌ まだお問い合わせ内容がありません。",
+                ephemeral=True
+            )
+            return
+
+        conversation = "\n".join(history)
+
+        embed = discord.Embed(
+            title="🎫 新しいお問い合わせ",
+            color=discord.Color.blurple()
+        )
+
+        embed.add_field(
+            name="👤 ユーザー",
+            value=f"{user.name}\nID: `{user.id}`",
+            inline=False
+        )
+
+        embed.add_field(
+            name="📂 種類",
+            value=ticket["type"],
+            inline=False
+        )
+
+        embed.add_field(
+            name="📝 会話内容",
+            value=conversation[:4000],
+            inline=False
+        )
+
+        embed.add_field(
+            name="🎫 チャンネル",
+            value=interaction.channel.mention,
+            inline=False
+        )
+
+        embed.set_footer(
+            text="サポート Bot｜対応完了したら ❤️ を押してください"
+        )
+
+        try:
+            message = await admin.send(embed=embed)
+
+            await message.add_reaction("❤️")
+
+            ticket["status"] = "sent"
+            ticket["admin_message_id"] = message.id
+
+            await interaction.response.send_message(
+                "✅ **管理者へお問い合わせ内容を送信しました！**\n\n"
+                "管理者が対応するまで、このチャンネルでお待ちください。"
+            )
+
+        except discord.Forbidden:
+            await interaction.response.send_message(
+                "❌ 管理者へDMを送れませんでした。",
+                ephemeral=True
+            )
+
+
+# =========================
+# 問い合わせ種類選択
+# =========================
 class SupportSelect(discord.ui.Select):
 
     def __init__(self):
@@ -84,56 +173,180 @@ class SupportSelect(discord.ui.Select):
     async def callback(self, interaction: discord.Interaction):
 
         user = interaction.user
+        guild = interaction.guild
         support_type = self.values[0]
 
-        # 既に受付中
+        if guild is None:
+            await interaction.response.send_message(
+                "❌ サーバー内で使用してください。",
+                ephemeral=True
+            )
+            return
+
         if user.id in tickets:
+            await interaction.response.send_message(
+                "⚠️ すでにお問い合わせ中です。",
+                ephemeral=True
+            )
+            return
+
+        admin = await find_admin(guild)
+
+        if admin is None:
+            await interaction.response.send_message(
+                "❌ 管理者が見つかりません。",
+                ephemeral=True
+            )
+            return
+
+        # =========================
+        # チャンネル権限
+        # =========================
+
+        overwrites = {
+
+            guild.default_role:
+                discord.PermissionOverwrite(
+                    view_channel=False
+                ),
+
+            user:
+                discord.PermissionOverwrite(
+                    view_channel=True,
+                    send_messages=True,
+                    read_message_history=True
+                ),
+
+            admin:
+                discord.PermissionOverwrite(
+                    view_channel=True,
+                    send_messages=True,
+                    read_message_history=True
+                ),
+
+            guild.me:
+                discord.PermissionOverwrite(
+                    view_channel=True,
+                    send_messages=True,
+                    read_message_history=True,
+                    manage_channels=True,
+                    manage_messages=True
+                )
+        }
+
+        # =========================
+        # チャンネル名
+        # =========================
+
+        channel_name = f"ticket-{user.name}".lower()
+
+        channel_name = "".join(
+            c if c.isalnum() or c in "-_" else "-"
+            for c in channel_name
+        )
+
+        channel_name = channel_name[:90]
+
+        # =========================
+        # チャンネル作成
+        # =========================
+
+        try:
+
+            channel = await guild.create_text_channel(
+                name=channel_name,
+                overwrites=overwrites,
+                reason="サポート Botによる問い合わせチケット作成"
+            )
+
+        except discord.Forbidden:
 
             await interaction.response.send_message(
-                "⚠️ 現在お問い合わせを受付中です。\n"
-                "対応が完了してから、もう一度利用してください。",
+                "❌ チャンネルを作成できません。\n"
+                "Botに「チャンネルの管理」権限を付けてください。",
                 ephemeral=True
             )
 
             return
 
-        # チケット登録
+        # =========================
+        # チケット情報保存
+        # =========================
+
         tickets[user.id] = {
+
             "type": support_type,
-            "status": "waiting",
-            "admin_message_id": None
+
+            "status": "conversation",
+
+            "channel_id": channel.id,
+
+            "admin_message_id": None,
+
+            "messages": []
         }
 
+        # =========================
+        # 最初のメッセージ
+        # =========================
+
+        embed = discord.Embed(
+
+            title="🎫 サポート Bot",
+
+            description=(
+                f"{user.mention} さん、お問い合わせありがとうございます！\n\n"
+
+                f"📂 種類：**{support_type}**\n\n"
+
+                "まず、詳しい内容を教えてください。\n"
+                "サポート Botがいくつか質問します。\n\n"
+
+                "最後に📨 **問い合わせを送信**ボタンを押すと、"
+                "管理者へ送信されます。"
+            ),
+
+            color=discord.Color.blurple()
+        )
+
+        await channel.send(embed=embed)
+
+        # =========================
+        # 最初の質問
+        # =========================
+
+        questions = {
+
+            "相談":
+                "💬 どんなことで困っていますか？",
+
+            "荒らし・迷惑行為の報告":
+                "🚨 どんな荒らし・迷惑行為がありましたか？",
+
+            "サーバーへの提案":
+                "💡 どんな提案をしたいですか？",
+
+            "その他":
+                "❓ お問い合わせ内容を詳しく教えてください。"
+        }
+
+        await channel.send(
+            questions[support_type]
+        )
+
         await interaction.response.send_message(
-            f"✅ **{support_type}**を受け付けました！\n\n"
-            "📩 BotからDMを送ります。",
+
+            "✅ **お問い合わせチャンネルを作成しました！**\n"
+
+            f"🎫 {channel.mention}",
+
             ephemeral=True
         )
 
-        # ユーザーDM
-        try:
 
-            await user.send(
-                "🎫 **じいちゃんの鯖 サポート**\n\n"
-                f"お問い合わせ種類：**{support_type}**\n\n"
-                "お問い合わせ内容を、このDMに送ってください。"
-            )
-
-        except discord.Forbidden:
-
-            del tickets[user.id]
-
-            await interaction.followup.send(
-                "❌ DMを送れませんでした。\n"
-                "BotからのDMを受け取れる設定にしてください。",
-                ephemeral=True
-            )
-
-
-# =====================================
+# =========================
 # サポートパネル
-# =====================================
-
+# =========================
 class SupportView(discord.ui.View):
 
     def __init__(self):
@@ -145,93 +358,16 @@ class SupportView(discord.ui.View):
         )
 
 
-# =====================================
-# 管理者DMへ送信
-# =====================================
-
-async def send_to_admin(
-    user,
-    support_type,
-    content
-):
-
-    admin = await find_admin()
-
-    # 管理者が見つからない
-    if admin is None:
-
-        print(
-            f"❌ 管理者が見つかりません: "
-            f"{ADMIN_USERNAME}"
-        )
-
-        return False
-
-    embed = discord.Embed(
-        title="🎫 新しいお問い合わせ",
-        color=discord.Color.blurple()
-    )
-
-    embed.add_field(
-        name="👤 ユーザー",
-        value=f"{user.name}\nID: `{user.id}`",
-        inline=False
-    )
-
-    embed.add_field(
-        name="📂 種類",
-        value=support_type,
-        inline=False
-    )
-
-    embed.add_field(
-        name="📝 内容",
-        value=content[:4000],
-        inline=False
-    )
-
-    embed.set_footer(
-        text="対応完了したら、このDMに 👍 を付けてください"
-    )
-
-    try:
-
-        message = await admin.send(
-            embed=embed
-        )
-
-        # 管理者が押す完了リアクション
-        await message.add_reaction("👍")
-
-        tickets[user.id]["admin_message_id"] = message.id
-
-        return True
-
-    except discord.Forbidden:
-
-        print(
-            "❌ 管理者へDMを送れません。"
-        )
-
-        return False
-
-
-# =====================================
-# DM受信
-# =====================================
-
+# =========================
+# メッセージ処理
+# =========================
 @bot.event
 async def on_message(message):
 
-    # Bot無視
     if message.author.bot:
         return
 
-    # DMのみ
-    if isinstance(
-        message.channel,
-        discord.DMChannel
-    ):
+    if message.guild:
 
         user_id = message.author.id
 
@@ -239,48 +375,48 @@ async def on_message(message):
 
             ticket = tickets[user_id]
 
-            # 最初のお問い合わせ
-            if ticket["status"] == "waiting":
+            if message.channel.id == ticket["channel_id"]:
 
-                ticket["status"] = "admin"
+                if ticket["status"] == "conversation":
 
-                # ユーザーへ自動返信
-                await message.channel.send(
-                    "✅ **お問い合わせを受け付けました！**\n\n"
-                    "🤖 管理者へ内容を送信しました。\n"
-                    "管理者が対応できるまでお待ちください。"
-                )
+                    ticket["messages"].append(
 
-                # 管理者へDM
-                success = await send_to_admin(
-                    message.author,
-                    ticket["type"],
-                    message.content
-                )
-
-                if not success:
+                        f"👤 {message.author.name}: "
+                        f"{message.content}"
+                    )
 
                     await message.channel.send(
-                        "⚠️ 管理者への送信に失敗しました。\n"
-                        "管理者に直接お知らせください。"
+
+                        "🤖 **サポート Bot**\n\n"
+                        "ありがとうございます！\n"
+                        "ほかに伝えておきたいことはありますか？\n\n"
+                        "内容がすべて終わったら、"
+                        "下の📨ボタンから管理者へ送信してください。"
+                    )
+
+                    await message.channel.send(
+
+                        "📨 **お問い合わせ内容がまとまったらこちら**",
+
+                        view=CloseView()
                     )
 
     await bot.process_commands(message)
 
 
-# =====================================
-# 管理者の👍を検知
-# =====================================
-
+# =========================
+# 管理者の ❤️ を検知
+# =========================
 @bot.event
 async def on_raw_reaction_add(payload):
 
-    # Bot自身は無視
-    if payload.user_id == bot.user.id:
+    if bot.user and payload.user_id == bot.user.id:
         return
 
-    # リアクションした人の情報
-    user = None
+    if str(payload.emoji) != "❤️":
+        return
+
+    admin = None
 
     for guild in bot.guilds:
 
@@ -289,21 +425,16 @@ async def on_raw_reaction_add(payload):
         )
 
         if member:
-            user = member
-            break
 
-    if user is None:
+            if member.name.lower() == ADMIN_USERNAME.lower():
+
+                admin = member
+
+                break
+
+    if admin is None:
         return
 
-    # 管理者か確認
-    if user.name.lower() != ADMIN_USERNAME.lower():
-        return
-
-    # 👍以外無視
-    if str(payload.emoji) != "👍":
-        return
-
-    # チケット検索
     target_user_id = None
 
     for user_id, ticket in tickets.items():
@@ -313,48 +444,74 @@ async def on_raw_reaction_add(payload):
         ) == payload.message_id:
 
             target_user_id = user_id
+
             break
 
     if target_user_id is None:
         return
 
-    # ユーザー取得
+    ticket = tickets[target_user_id]
+
+    channel = bot.get_channel(
+        ticket["channel_id"]
+    )
+
+    if channel is None:
+
+        try:
+
+            channel = await bot.fetch_channel(
+                ticket["channel_id"]
+            )
+
+        except discord.NotFound:
+
+            del tickets[target_user_id]
+
+            return
+
+    # =========================
+    # チャンネルに完了通知
+    # =========================
+
+    await channel.send(
+
+        "✅ **サポート Bot**\n\n"
+        "管理者の対応が完了いたしました！\n\n"
+        "お問い合わせありがとうございました。"
+    )
+
+    # =========================
+    # ユーザーにもDM
+    # =========================
+
     try:
 
-        target_user = await bot.fetch_user(
+        user = await bot.fetch_user(
             target_user_id
         )
 
-    except discord.NotFound:
+        await user.send(
 
-        return
-
-    # ユーザーへ完了DM
-    try:
-
-        await target_user.send(
-            "✅ **管理者の対応が完了いたしました。**\n\n"
-            "お問い合わせありがとうございました！"
+            "✅ **サポート Bot**\n\n"
+            "お問い合わせの対応が完了しました！\n\n"
+            "お問い合わせありがとうございました。"
         )
 
-    except discord.Forbidden:
+    except:
 
-        print(
-            "❌ ユーザーへのDMに失敗しました。"
-        )
+        pass
 
-    # チケット終了
     del tickets[target_user_id]
 
     print(
-        f"✅ 対応完了: {target_user.name}"
+        f"✅ サポート Bot｜対応完了: {target_user_id}"
     )
 
 
-# =====================================
-# /チケット
-# =====================================
-
+# =========================
+# /チケット コマンド
+# =========================
 @bot.tree.command(
     name="チケット",
     description="サポートパネルを設置します"
@@ -367,36 +524,45 @@ async def ticket(
 ):
 
     embed = discord.Embed(
-        title="🎫 じいちゃんの鯖 サポート",
+
+        title="🎫 サポート Bot",
+
         description=(
+
             "お問い合わせはこちらから！\n\n"
+
             "下のメニューから内容を選択してください。\n\n"
+
             "💬 **相談**\n"
             "🚨 **荒らし・迷惑行為の報告**\n"
             "💡 **サーバーへの提案**\n"
-            "❓ **その他**"
+            "❓ **その他**\n\n"
+
+            "🤖 **サポート Botがお問い合わせを受け付けます。**"
         ),
+
         color=discord.Color.blurple()
     )
 
     embed.set_footer(
-        text="じいちゃんの鯖 サポートBot"
+        text="サポート Bot"
     )
 
     await interaction.response.send_message(
+
         embed=embed,
+
         view=SupportView()
     )
 
 
-# =====================================
-# /チケット 権限エラー
-# =====================================
-
+# =========================
+# コマンドエラー
+# =========================
 @ticket.error
 async def ticket_error(
     interaction: discord.Interaction,
-    error: app_commands.AppCommandError
+    error
 ):
 
     if isinstance(
@@ -405,36 +571,38 @@ async def ticket_error(
     ):
 
         await interaction.response.send_message(
+
             "❌ このコマンドは管理者のみ使用できます。",
+
             ephemeral=True
         )
 
 
-# =====================================
-# Bot起動準備
-# =====================================
-
+# =========================
+# Bot起動時
+# =========================
 @bot.event
 async def setup_hook():
 
-    # 再起動後もパネルを動かす
     bot.add_view(
         SupportView()
     )
 
-    # スラッシュコマンド同期
+    bot.add_view(
+        CloseView()
+    )
+
     await bot.tree.sync()
 
 
-# =====================================
-# 起動
-# =====================================
-
+# =========================
+# ログイン成功
+# =========================
 @bot.event
 async def on_ready():
 
     print(
-        f"✅ Botログイン成功: {bot.user}"
+        f"🤖 サポート Bot ログイン成功: {bot.user}"
     )
 
     print(
@@ -442,4 +610,7 @@ async def on_ready():
     )
 
 
+# =========================
+# Bot起動
+# =========================
 bot.run(TOKEN)
